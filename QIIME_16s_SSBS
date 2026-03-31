@@ -1,0 +1,188 @@
+########################################################################################################
+Pipeline to go from raw 16sV4 reads from IMR core to ASV table and rep seqs
+Steps:
+1) check for primers in raw data
+2) load into QIIME2
+2a) Denoise, chimera check, quality check, with DADA2
+3) Assign Taxonomy with SILVA
+4) Export ASV table, rep seps. To load into R
+########################################################################################################
+
+
+
+########################################################################################################
+Step 1 
+########################################################################################################
+#Check if primers are present in a sequencing file. Lets check for the forward primer in both the R1 and R2 reads
+#here i use [ATCG] as a bash compatible version of Y and R in primer sequences
+grep -c --color 'GTG[CT]CAGC[AC]GCCGCGGTAA' *.fastq.gz
+
+#let check reverse primer just in case
+grep -E -c --color 'GGACTAC[ATCG][ACG]GGGT[AT]TCTAAT' *.fastq.gz
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+RESULTS: 
+- No primers found, must have been removed by the core
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+########################################################################################################
+Step 2 
+########################################################################################################
+#activate QIIME2 conda environment. To set up QIIME2 environement on cluster, see https://docs.qiime2.org/2024.10/install/native/
+conda activate qiime2-amplicon-2024.10
+
+----------------------------
+#2) IMPORT DEMULTIPLEXED DATA
+----------------------------
+#import sequence data to QIIME, uses manifest.tsv to locate forward and reverse reads.
+#Phred33 is standard illumina quality score
+qiime tools import \
+  --type 'SampleData[PairedEndSequencesWithQuality]' \
+  --input-path 16S_manifest_SSBS.tsv \
+  --input-format PairedEndFastqManifestPhred33V2 \
+  --output-path imported-paired-end-seqs_16s.qza
+
+#CREATE a summary of demultiplexed data
+qiime demux summarize \
+  --i-data imported-paired-end-seqs_16s.qza \
+  --o-visualization demux_16s.qzv
+
+#Upload .qzv file to https://view.qiime2.org/ to visualize results
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+RESULTS: of the 2 samples
+- For both forward and reverse primers. Have identical numbers, which makes sense
+-Total reads: 	286718, mean: 	143359.0, median: 	143359.0
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+
+
+----------------------------
+#2a) Denoise DADA2
+----------------------------
+#reminder: forward is left and reverse is right
+#I am choosing to run DADA2 in QIIME2 becuase I like the combined plots of PHRED score by base position
+#I am choosing these trunc parameters as they are where the median Phred score dips below 30 (for a sustained period)
+
+
+#Lets try with and without trunc
+# Truncate with adjusted chimera filtering
+# I adjusted the chimera filtering to prevent most reads from being dropped
+qiime dada2 denoise-paired \
+  --i-demultiplexed-seqs imported-paired-end-seqs_16s.qza \
+  --p-trim-left-f 0 \
+  --p-trunc-len-f 265 \
+  --p-trim-left-r 0 \
+  --p-trunc-len-r 210 \
+  --p-min-fold-parent-over-abundance 3 \
+  --o-representative-sequences rep-seqs_16s_trunc.qza \
+  --o-table table_16s_trunc.qza \
+  --o-denoising-stats denoising-stats_16s_trunc.qza \
+  --p-n-threads 8
+
+
+  qiime metadata tabulate \
+  --m-input-file denoising-stats_16s_trunc.qza\
+  --o-visualization dada2-stats-summ_16s_trunc.qzv
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+RESULTS: 
+- 2 samples sequenced
+- Tried many parameters and these work best. In total about 45% of data ends up kept and merged. 
+-these parameters keep about 78% of reads through filtering, 67% through merge, and 45% through chimera check.
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+
+
+
+----------------------------
+#2b) CLUSTER OTU using vsearch
+----------------------------
+
+#Here I am choosing 1.0 similarity to keep ASV
+#CLUSTER OTUs by using vsearch de novo
+qiime vsearch cluster-features-de-novo \
+  --i-table table_16s_trunc.qza  \
+  --i-sequences rep-seqs_16s_trunc.qza \
+  --p-perc-identity 1.0 \
+  --o-clustered-table table-clustered_1.0_16s.qza \
+  --o-clustered-sequences rep-seqs-clustered_1.0_16s.qza
+
+#SUMMARIZE and view summaries of the FeatureTable (OTU table) and FeatureData (representative seqs)
+qiime feature-table summarize \
+  --i-table table-clustered_1.0_16s.qza \
+  --o-visualization table-clustered_1.0_16s.qza
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+RESULTS: 
+-Number of samples: 2
+-Number of 100% ASV:  3,994
+-Total frequency of OTUs: 128,804
+-I do not actually use the fake clustering downstream, just a quick way to check on ASV total
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+
+
+
+########################################################################################################
+Step 3: Assign Taxonomy using SILVA reference
+########################################################################################################
+
+#Download SILVA 138 99% OTUs full-length sequences
+wget https://data.qiime2.org/2024.10/common/silva-138-99-seqs.qza
+
+#extract just v4 region, using primers used in the study (Walters 2015), improves assingments
+qiime feature-classifier extract-reads \
+  --i-sequences silva-138-99-seqs.qza \
+  --p-f-primer GTGYCAGCMGCCGCGGTAA \
+  --p-r-primer GGACTACNVGGGTWTCTAAT \
+  --p-min-length 100 \
+  --p-max-length 400 \
+  --o-reads silva-138-99-seqs-v4.qza
+
+#Train the classifier
+qiime feature-classifier fit-classifier-naive-bayes \
+  --i-reference-reads silva-138-99-seqs-v4.qza \
+  --i-reference-taxonomy silva-138-99-tax.qza \
+  --o-classifier silva-138-99-v4-classifier.qza
+
+
+#Assign taxonomy with naive bayes classifier
+qiime feature-classifier classify-sklearn \
+  --i-classifier /scratch/tyjames_root/tyjames0/qmoon/AgeDiversityDistance/Moon16s/silva-138-99-v4-classifier.qza \
+  --i-reads rep-seqs_16s_trunc.qza \
+  --o-classification taxonomy_16s.qza
+
+
+
+########################################################################################################
+Step 4: Export taxonomy, rep-seqs, and ASV table 
+########################################################################################################
+#export taxonomy as TSV
+qiime tools export \
+  --input-path taxonomy_16s.qza \
+  --output-path taxonomy_export
+
+
+#export rep-seqs
+qiime tools export \
+  --input-path rep-seqs_16s_trunc.qza \
+  --output-path rep_seqs_export
+
+
+#export ASV table
+#convert to BIOM
+qiime tools export \
+  --input-path table_16s_trunc.qza \
+  --output-path otu_table_export
+
+#convert BIOM to TSV
+biom convert \
+  -i otu_table_export/feature-table.biom \
+  -o ASV_table_SSBS.tsv \
+  --to-tsv
+
+
