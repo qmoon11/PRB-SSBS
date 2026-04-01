@@ -1,0 +1,46 @@
+#This script takes the rep-seqs FASTA file and BLASTS against Unite for 10 best matches
+
+#################################################################################
+Download latest UNITE All Euk Database
+#################################################################################
+
+#I have already done this in another directory so I will just access the unzipped FASTA reference
+
+
+#################################################################################
+Download BLAST
+#################################################################################
+wget https://ftp.ncbi.nlm.nih.gov/blast/executables/blast+/LATEST/ncbi-blast-2.17.0+-x64-linux.tar.gz
+tar -xzf ncbi-blast-2.17.0+-x64-linux.tar.gz
+export PATH=$PWD/ncbi-blast-2.17.0+/bin:$PATH
+
+
+
+#################################################################################
+Build a BLAST database
+#################################################################################
+mkdir -p BLAST
+
+makeblastdb \
+  -in sh_general_release_dynamic_s_all_19.02.2025.fasta \
+  -dbtype nucl \
+  -out BLAST/uniteITSEuk_db
+
+#################################################################################
+Run MegaBLAST search
+#################################################################################
+
+blastn \
+  -task megablast \
+  -query rep-seqs/dna-sequences_ITS_SSBS.fasta \
+  -db BLAST/uniteITSEuk_db \
+  -out BLAST/megablast_ITS2.tsv \
+  -word_size 28 \
+  -reward 1 \
+  -penalty -2 \
+  -gapopen 0 \
+  -gapextend 2 \
+  -max_target_seqs 10 \
+  -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore stitle" \
+  -num_threads 8
+
