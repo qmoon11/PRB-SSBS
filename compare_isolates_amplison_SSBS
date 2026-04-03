@@ -1,0 +1,85 @@
+########################################################################################################
+Compare amplicon rep-seqs to all isolate sequences
+########################################################################################################
+#This script uses the sanger sequences generates from isolates to build a BLAST database. Then it compares the isolate sequences to the amplicon ITS
+
+#make blast database from isolate seqs
+makeblastdb \
+    -in SSBS_Sanger_Isolates.FASTA \
+    -dbtype nucl \
+    -out isolates_SSBB_db
+
+
+
+#Run BLASTn
+blastn \
+    -task megablast \
+    -query rep-seqs/dna-sequences_ITS_SSBS.fasta \
+    -db isolates_SSBB_db \
+    -out blast_isolates_amplicon_SSBS_ITS.tsv \
+    -word_size 28 \
+    -reward 1 \
+    -penalty -2 \
+    -gapopen 0 \
+    -gapextend 2 \
+    -max_target_seqs 10 \
+    -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore stitle" \
+    -num_threads 8
+
+
+#Ran in R
+
+#read in BLAST results
+blast_isolates_its <- read_tsv(
+  "ITS/blast_isolates_amplicon_SSBS_ITS.tsv",
+  col_names = c(
+    "query_id", "subject_id", "percent_identity", "alignment_length",
+    "mismatches", "gap_opens", "q_start", "q_end", "s_start", "s_end",
+    "e_value", "bit_score", "stitle"
+  ),
+  show_col_types = FALSE
+)
+
+
+
+blast_isolates_its_filtered <- blast_isolates_its %>%
+  filter(alignment_length > 50, percent_identity >= 90)
+
+########################################################################################################
+Cluster unmatched seqs
+########################################################################################################
+
+# 1) Cluster at 97% and name OTUs OTU1, OTU2, ...
+vsearch --cluster_fast Isolates/SSBS_Sanger_Isolates_ITS1.fasta \
+  --id 0.97 \
+  --centroids otus97_ITS1.fasta \
+  --uc clusters97_ITS1.uc \
+  --relabel OTU
+
+# 2) Make a 2-column map: OTU    sequence_id
+awk 'BEGIN{FS="\t"; OFS="\t"}
+     $1=="S"{print $9,$9}
+     $1=="H"{print $10,$9}' clusters97_ITS1.uc > OTU_to_sequences.tsv
+
+#Only 1 OTU remains, PT03 Pencillium cf. ortum
+
+#Pen PT03 OTU no match, find closest result
+vsearch --usearch_global Isolates/PT03_penicillium.FASTA \
+  --db ITS/dna-sequences_ITS_SSBS.fasta \
+  --id 0.0 \
+  --strand both \
+  --maxaccepts 1 --maxrejects 0 \
+  --blast6out besthit.tsv \
+  --blast6out_fields query+target+id+alnlen+mism+gaps+qlo+qhi+tlo+thi+ql+tl
+  #result closest is 89.0 % identity
+
+########################################################################################################
+Results
+########################################################################################################
+#result:
+Acremonium OTU (no match as only sequence with SR1R and NS1 primers)
+Penicillium OTU (no match, 89.0 % identity)
+Scedosporium OTU (match f4ca0e638d89d15fdf2efa177740c9ed)
+Exophiala (match 9d66dd8f2085b9f1745d039dbfb65b30)
+Paracremonium (match feafda5ba95fcf36d141ed4058f141fc)
+
