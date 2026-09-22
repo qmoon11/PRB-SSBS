@@ -1,0 +1,370 @@
+#################################################################################################
+#1. Software and database setup
+#################################################################################################
+
+#!/usr/bin/env bash
+#SBATCH --job-name=func_setup
+#SBATCH --account=tyjames0
+#SBATCH --partition=standard
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=12:00:00
+#SBATCH --output=/scratch/tyjames_root/tyjames0/qmoon/SSBS/genomes/results/logs/setup_%j.out
+#SBATCH --error=/scratch/tyjames_root/tyjames0/qmoon/SSBS/genomes/results/logs/setup_%j.err
+
+set -euo pipefail
+
+PROJECT_DIR="/scratch/tyjames_root/tyjames0/qmoon/SSBS/genomes"
+
+RESULT_DIR="${PROJECT_DIR}/results"
+SOFTWARE_DIR="${RESULT_DIR}/software"
+ENV_DIR="${RESULT_DIR}/environments"
+DATABASE_DIR="${RESULT_DIR}/databases"
+LOG_DIR="${RESULT_DIR}/logs"
+
+MICROMAMBA_DIR="${SOFTWARE_DIR}/micromamba"
+MICROMAMBA="${MICROMAMBA_DIR}/bin/micromamba"
+
+JAVA_ENV="${ENV_DIR}/java"
+DBCAN_ENV="${ENV_DIR}/dbcan"
+DBCAN_RUN="${DBCAN_ENV}/bin/run_dbcan"
+DBCAN_DB="${DATABASE_DIR}/dbCAN"
+
+INTERPRO_VERSION="5.73-104.0"
+INTERPRO_ARCHIVE="interproscan-${INTERPRO_VERSION}-64-bit.tar.gz"
+INTERPRO_URL="https://ftp.ebi.ac.uk/pub/software/unix/iprscan/5/${INTERPRO_VERSION}/${INTERPRO_ARCHIVE}"
+INTERPRO_DIR="${SOFTWARE_DIR}/interproscan-${INTERPRO_VERSION}"
+INTERPROSCAN="${INTERPRO_DIR}/interproscan.sh"
+
+mkdir -p \
+    "${SOFTWARE_DIR}" \
+    "${ENV_DIR}" \
+    "${DATABASE_DIR}" \
+    "${LOG_DIR}" \
+    "${DBCAN_DB}"
+
+cd "${PROJECT_DIR}"
+
+echo "Setup started: $(date)"
+echo "Compute node: $(hostname)"
+
+# ------------------------------------------------------------
+# Install Micromamba if it is unavailable
+# ------------------------------------------------------------
+
+if [[ ! -x "${MICROMAMBA}" ]]; then
+
+    mkdir -p "${MICROMAMBA_DIR}"
+
+    curl \
+        --location \
+        --fail \
+        --retry 5 \
+        "https://micro.mamba.pm/api/micromamba/linux-64/latest" \
+        --output "${RESULT_DIR}/micromamba.tar.bz2"
+
+    tar -xjf "${RESULT_DIR}/micromamba.tar.bz2" \
+        -C "${MICROMAMBA_DIR}"
+fi
+
+"${MICROMAMBA}" --version
+
+# ------------------------------------------------------------
+# Install Java 11 for InterProScan
+# ------------------------------------------------------------
+
+if [[ ! -x "${JAVA_ENV}/bin/java" ]]; then
+
+    "${MICROMAMBA}" create \
+        --yes \
+        --prefix "${JAVA_ENV}" \
+        --channel conda-forge \
+        "openjdk=11"
+fi
+
+export JAVA_HOME="${JAVA_ENV}"
+export PATH="${JAVA_HOME}/bin:${PATH}"
+
+java -version
+
+# ------------------------------------------------------------
+# Download and extract InterProScan
+# ------------------------------------------------------------
+
+if [[ ! -x "${INTERPROSCAN}" ]]; then
+
+    curl \
+        --location \
+        --fail \
+        --retry 5 \
+        --retry-delay 10 \
+        --continue-at - \
+        "${INTERPRO_URL}" \
+        --output "${SOFTWARE_DIR}/${INTERPRO_ARCHIVE}"
+
+    gzip -t "${SOFTWARE_DIR}/${INTERPRO_ARCHIVE}"
+
+    tar -xzf "${SOFTWARE_DIR}/${INTERPRO_ARCHIVE}" \
+        -C "${SOFTWARE_DIR}"
+
+    chmod +x "${INTERPROSCAN}"
+fi
+
+"${INTERPROSCAN}" --version
+
+# ------------------------------------------------------------
+# Install dbCAN 5.2.9 with Python 3.11
+# ------------------------------------------------------------
+
+if [[ ! -x "${DBCAN_RUN}" ]]; then
+
+    "${MICROMAMBA}" create \
+        --yes \
+        --prefix "${DBCAN_ENV}" \
+        --channel conda-forge \
+        --channel bioconda \
+        "python=3.11" \
+        requests \
+        dbcan=5.2.9 \
+        diamond
+fi
+
+# dbCAN invokes executables such as DIAMOND by command name.
+export PATH="${DBCAN_ENV}/bin:${PATH}"
+
+"${DBCAN_ENV}/bin/python" --version
+"${DBCAN_ENV}/bin/python" -c \
+    'import requests, dbcan; print("dbCAN imports successful")'
+
+diamond version
+"${DBCAN_RUN}" version || true
+
+# ------------------------------------------------------------
+# Download core dbCAN databases
+#
+# CGC-specific components were excluded because the analysis
+# focused on protein-level CAZyme annotation rather than
+# carbohydrate gene-cluster prediction.
+# ------------------------------------------------------------
+
+"${DBCAN_RUN}" database \
+    --db_dir "${DBCAN_DB}" \
+    --aws_s3 \
+    --no-cgc \
+    --resume \
+    --retries 5 \
+    --timeout 180
+
+# Verify core databases.
+for REQUIRED_FILE in \
+    "CAZy.dmnd" \
+    "dbCAN.hmm" \
+    "dbCAN-sub.hmm"; do
+
+    if [[ ! -s "${DBCAN_DB}/${REQUIRED_FILE}" ]]; then
+        echo "ERROR: Missing dbCAN database file: ${REQUIRED_FILE}"
+        exit 1
+    fi
+done
+
+echo "Setup completed: $(date)"
+
+
+#################################################################################################
+#2. InterProScan and dbCAN annotation array
+#################################################################################################
+#!/usr/bin/env bash
+#SBATCH --job-name=func_annot
+#SBATCH --account=tyjames0
+#SBATCH --partition=standard
+#SBATCH --array=0-4
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=96G
+#SBATCH --time=72:00:00
+#SBATCH --output=/scratch/tyjames_root/tyjames0/qmoon/SSBS/genomes/results/logs/annotation_%A_%a.out
+#SBATCH --error=/scratch/tyjames_root/tyjames0/qmoon/SSBS/genomes/results/logs/annotation_%A_%a.err
+
+set -euo pipefail
+
+PROJECT_DIR="/scratch/tyjames_root/tyjames0/qmoon/SSBS/genomes"
+
+RESULT_DIR="${PROJECT_DIR}/results"
+INTERPRO_ROOT="${RESULT_DIR}/InterProScan"
+DBCAN_ROOT="${RESULT_DIR}/dbCAN"
+LOG_DIR="${RESULT_DIR}/logs"
+TMP_ROOT="${RESULT_DIR}/tmp"
+
+JAVA_ENV="${RESULT_DIR}/environments/java"
+DBCAN_ENV="${RESULT_DIR}/environments/dbcan"
+DBCAN_DB="${RESULT_DIR}/databases/dbCAN"
+
+INTERPROSCAN="${RESULT_DIR}/software/interproscan-5.73-104.0/interproscan.sh"
+DBCAN_RUN="${DBCAN_ENV}/bin/run_dbcan"
+
+GENOMES=(
+    "Acr"
+    "Exo"
+    "Para"
+    "Pen"
+    "Sced"
+)
+
+PROTEOMES=(
+    "${PROJECT_DIR}/Acr/Acremonium_sp._UM1754.proteins.fa"
+    "${PROJECT_DIR}/Exo/Exophiala_mansonii_UM1755.proteins.fa"
+    "${PROJECT_DIR}/Para/Paracremonium_sp._UM1742.proteins.fa"
+    "${PROJECT_DIR}/Pen/Penicillium_sp._UM1743.proteins.fa"
+    "${PROJECT_DIR}/Sced/Scedosporium_sp._UM1744.proteins.fa"
+)
+
+INDEX="${SLURM_ARRAY_TASK_ID}"
+GENOME="${GENOMES[$INDEX]}"
+PROTEOME="${PROTEOMES[$INDEX]}"
+
+INTERPRO_OUT="${INTERPRO_ROOT}/${GENOME}"
+DBCAN_OUT="${DBCAN_ROOT}/${GENOME}"
+INTERPRO_BASE="${INTERPRO_OUT}/${GENOME}_interpro"
+
+JOB_TMP="${SLURM_TMPDIR:-${TMP_ROOT}/${SLURM_JOB_ID}_${INDEX}}"
+INTERPRO_TMP="${JOB_TMP}/interpro"
+
+mkdir -p \
+    "${INTERPRO_OUT}" \
+    "${DBCAN_OUT}" \
+    "${LOG_DIR}" \
+    "${INTERPRO_TMP}"
+
+cd "${PROJECT_DIR}"
+
+# ------------------------------------------------------------
+# Validate input
+# ------------------------------------------------------------
+
+if [[ ! -s "${PROTEOME}" ]]; then
+    echo "ERROR: Protein FASTA missing or empty: ${PROTEOME}"
+    exit 1
+fi
+
+N_PROTEINS="$(grep -c '^>' "${PROTEOME}")"
+
+echo "Genome: ${GENOME}"
+echo "Proteome: ${PROTEOME}"
+echo "Predicted proteins: ${N_PROTEINS}"
+echo "Started: $(date)"
+echo "Node: $(hostname)"
+
+# ------------------------------------------------------------
+# Configure Java 11 and dbCAN dependencies
+# ------------------------------------------------------------
+
+export JAVA_HOME="${JAVA_ENV}"
+export PATH="${JAVA_HOME}/bin:${DBCAN_ENV}/bin:${PATH}"
+
+java -version
+diamond version
+
+# ------------------------------------------------------------
+# Run InterProScan
+#
+# Outputs:
+#   TSV
+#   GFF3
+#   JSON
+#
+# GO terms and pathway cross-references were requested.
+# ------------------------------------------------------------
+
+if [[ ! -s "${INTERPRO_OUT}/INTERPROSCAN_COMPLETE.txt" ]]; then
+
+    "${INTERPROSCAN}" \
+        -i "${PROTEOME}" \
+        -b "${INTERPRO_BASE}" \
+        -f "TSV,GFF3,JSON" \
+        -goterms \
+        -pa \
+        -cpu "${SLURM_CPUS_PER_TASK}" \
+        -T "${INTERPRO_TMP}" \
+        > "${LOG_DIR}/${GENOME}_interpro.stdout.log" \
+        2> "${LOG_DIR}/${GENOME}_interpro.stderr.log"
+
+    if [[ ! -s "${INTERPRO_BASE}.tsv" ]]; then
+        echo "ERROR: InterProScan did not create a nonempty TSV."
+        exit 1
+    fi
+
+    {
+        echo "Genome: ${GENOME}"
+        echo "Input: ${PROTEOME}"
+        echo "InterProScan version: 5.73-104.0"
+        echo "Rows: $(wc -l < "${INTERPRO_BASE}.tsv")"
+        echo "Completed: $(date)"
+    } > "${INTERPRO_OUT}/INTERPROSCAN_COMPLETE.txt"
+fi
+
+# ------------------------------------------------------------
+# Run dbCAN protein-level CAZyme annotation
+#
+# The following components were used:
+#   - DIAMOND against CAZy
+#   - dbCAN HMMs
+#   - dbCAN-sub HMMs
+#
+# CGC-specific annotation was not run.
+# ------------------------------------------------------------
+
+if [[ ! -s "${DBCAN_OUT}/DBCAN_COMPLETE.txt" ]]; then
+
+    # Stop rather than mix a new run with partial output.
+    if find "${DBCAN_OUT}" \
+        -mindepth 1 \
+        -type f \
+        ! -name "DBCAN_COMPLETE.txt" \
+        -print -quit |
+        grep -q .; then
+
+        echo "ERROR: Partial dbCAN output exists in ${DBCAN_OUT}."
+        echo "Move or remove the partial files before rerunning."
+        exit 1
+    fi
+
+    "${DBCAN_RUN}" CAZyme_annotation \
+        --input_raw_data "${PROTEOME}" \
+        --output_dir "${DBCAN_OUT}" \
+        --db_dir "${DBCAN_DB}" \
+        --mode protein \
+        --threads "${SLURM_CPUS_PER_TASK}" \
+        > "${LOG_DIR}/${GENOME}_dbcan.stdout.log" \
+        2> "${LOG_DIR}/${GENOME}_dbcan.stderr.log"
+
+    if [[ ! -s "${DBCAN_OUT}/overview.tsv" ]]; then
+        echo "ERROR: dbCAN did not create overview.tsv."
+        exit 1
+    fi
+
+    {
+        echo "Genome: ${GENOME}"
+        echo "Input: ${PROTEOME}"
+        echo "dbCAN version: 5.2.9"
+        echo "Overview rows: $(wc -l < "${DBCAN_OUT}/overview.tsv")"
+        echo "Completed: $(date)"
+    } > "${DBCAN_OUT}/DBCAN_COMPLETE.txt"
+fi
+
+echo "Finished ${GENOME}: $(date)"
+
+#################################################################################################
+#Submission commands
+#################################################################################################
+cd /scratch/tyjames_root/tyjames0/qmoon/SSBS/genomes
+
+mkdir -p results/logs
+
+SETUP_JOB=$(sbatch --parsable setup_functional_annotation.sbatch)
+echo "Setup job: ${SETUP_JOB}"
+
+ARRAY_JOB=$(sbatch \
+    --parsable \
+    --dependency="afterok:${SETUP_JOB}" \
+    run_functional_annotation.sbatch)
+
+echo "Annotation array: ${ARRAY_JOB}"
